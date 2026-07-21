@@ -66,6 +66,18 @@ checks.expect(!onDisk.contains("plaintext-secret"), "secret is encrypted on disk
 checks.expect(SecureLocalStore.delete(service: "svc", account: "acct"), "delete returns true")
 checks.expect(SecureLocalStore.read(service: "svc", account: "acct") == nil, "read after delete → nil")
 
+// BUG-6 regression: many concurrent saves of distinct keys must ALL survive
+// (an unlocked read-modify-write loses updates; under TSan this also flags the
+// data race). Fails loudly if the store's ioLock ever regresses.
+let concN = 50
+DispatchQueue.concurrentPerform(iterations: concN) { i in
+    _ = SecureLocalStore.save(service: "conc", account: "k\(i)", data: "v\(i)".data(using: .utf8)!)
+}
+let allSurvived = (0..<concN).allSatisfy {
+    SecureLocalStore.read(service: "conc", account: "k\($0)") == "v\($0)".data(using: .utf8)!
+}
+checks.expect(allSurvived, "concurrent saves all persist (no lost update)")
+
 let credConn = NASConnection(host: "192.168.0.9", port: 5001, username: "me")
 checks.expect(CredentialStore.addOrUpdate(connection: credConn, password: "pw"), "credential addOrUpdate")
 checks.expectEqual(CredentialStore.savedConnections().map(\.id), [credConn.id], "saved connections list")

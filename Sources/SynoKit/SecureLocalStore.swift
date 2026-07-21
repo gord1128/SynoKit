@@ -53,10 +53,19 @@ public enum SecureLocalStore {
     private static var fileURL: URL { baseDirectory.appendingPathComponent("secure_store.json") }
     private static var masterKeyURL: URL { baseDirectory.appendingPathComponent("secure_store.key") }
 
+    // Serializes the entries-file read-modify-write (save/delete) so concurrent
+    // writes — e.g. saving a password and pinning a cert during one connect —
+    // don't lose each other's update. `keyLock` guards the one-time master-key
+    // create so two concurrent first writes can't generate two keys. The two are
+    // never held nested (encryptionKey is resolved before ioLock is taken).
+    private static let ioLock = NSLock()
+    private static let keyLock = NSLock()
+
     /// A random 256-bit key read-or-created from `masterKeyURL`. Computed per
     /// call (not cached) so that switching `directoryOverride` in tests always
     /// pairs the key with the matching data blob.
     private static var encryptionKey: SymmetricKey {
+        keyLock.lock(); defer { keyLock.unlock() }
         let url = masterKeyURL
         if let existing = try? Data(contentsOf: url), existing.count == 32 {
             return SymmetricKey(data: existing)
@@ -91,6 +100,7 @@ public enum SecureLocalStore {
     public static func save(service: String, account: String, data: Data) -> Bool {
         guard let sealed = try? AES.GCM.seal(data, using: encryptionKey),
               let combined = sealed.combined else { return false }
+        ioLock.lock(); defer { ioLock.unlock() }
         var entries = loadEntries()
         entries[storageKey(service: service, account: account)] = combined.base64EncodedString()
         writeEntries(entries)
@@ -118,6 +128,7 @@ public enum SecureLocalStore {
 
     @discardableResult
     public static func delete(service: String, account: String) -> Bool {
+        ioLock.lock(); defer { ioLock.unlock() }
         var entries = loadEntries()
         entries.removeValue(forKey: storageKey(service: service, account: account))
         writeEntries(entries)
