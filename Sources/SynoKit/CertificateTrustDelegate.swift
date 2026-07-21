@@ -10,16 +10,25 @@ public enum CertificateTrustEvent {
 /// globally: a session using this delegate only ever pins/trusts certificates
 /// for the specific `host`/`port` it was constructed with.
 ///
-/// `@unchecked Sendable`: the mutable `pendingTrustEvent` is written on the
-/// URLSession delegate queue during a challenge and read by the client only
-/// after the request's continuation resumes (a happens-after relationship),
-/// so there is no real concurrent access.
+/// `@unchecked Sendable`: this delegate is shared by one session that runs many
+/// requests concurrently (e.g. a photo grid loading thumbnails in parallel), so
+/// every `pendingTrustEvent` access — the challenge-queue writes, the per-request
+/// `clearPendingEvent()`, and the client's read — goes through `lock`. (An earlier
+/// version assumed a single sequential owner; ThreadSanitizer showed concurrent
+/// `clearPendingEvent()` calls racing on the property.) The event is host-level
+/// (this delegate is per host:port) and only set when trust fails, which happens
+/// during the sequential connect handshake, so a single slot is still correct.
 public final class CertificateTrustDelegate: NSObject, URLSessionDelegate, @unchecked Sendable {
     public let host: String
     public let port: Int
 
+    private let lock = NSLock()
     /// Set when standard trust evaluation fails and a user decision is needed.
-    public private(set) var pendingTrustEvent: CertificateTrustEvent?
+    private var _pendingTrustEvent: CertificateTrustEvent?
+    public var pendingTrustEvent: CertificateTrustEvent? {
+        lock.lock(); defer { lock.unlock() }
+        return _pendingTrustEvent
+    }
 
     public init(host: String, port: Int) {
         self.host = host
@@ -27,7 +36,13 @@ public final class CertificateTrustDelegate: NSObject, URLSessionDelegate, @unch
     }
 
     public func clearPendingEvent() {
-        pendingTrustEvent = nil
+        lock.lock(); defer { lock.unlock() }
+        _pendingTrustEvent = nil
+    }
+
+    private func setPendingEvent(_ event: CertificateTrustEvent) {
+        lock.lock(); defer { lock.unlock() }
+        _pendingTrustEvent = event
     }
 
     public func urlSession(
@@ -62,11 +77,11 @@ public final class CertificateTrustDelegate: NSObject, URLSessionDelegate, @unch
                 completionHandler(.useCredential, URLCredential(trust: serverTrust))
             } else {
                 let oldFingerprint = CertificateFingerprint.sha256(of: pinnedData)
-                pendingTrustEvent = .changed(oldFingerprint: oldFingerprint, newFingerprint: fingerprint, newCertificateData: certificateData)
+                setPendingEvent(.changed(oldFingerprint: oldFingerprint, newFingerprint: fingerprint, newCertificateData: certificateData))
                 completionHandler(.cancelAuthenticationChallenge, nil)
             }
         } else {
-            pendingTrustEvent = .untrusted(fingerprint: fingerprint, certificateData: certificateData)
+            setPendingEvent(.untrusted(fingerprint: fingerprint, certificateData: certificateData))
             completionHandler(.cancelAuthenticationChallenge, nil)
         }
     }
