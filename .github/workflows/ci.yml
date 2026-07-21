@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Build + offline checks
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Swift version
+        run: swift --version
+      - name: Build
+        run: swift build
+      - name: Run offline checks
+        run: swift run SynoKitChecks
+
+  thread-sanitizer:
+    name: ThreadSanitizer
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      # Runs the whole harness — including the concurrent-save (BUG-6) and
+      # concurrent-request (BUG-2) stress tests — under TSan. Fails the build if
+      # any data race reappears in the shared session/credential state.
+      - name: Offline checks under ThreadSanitizer
+        run: swift run -Xswiftc -sanitize=thread SynoKitChecks
