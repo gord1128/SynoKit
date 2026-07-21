@@ -21,14 +21,36 @@ public final class SynologyClient: @unchecked Sendable {
     private let sessionName: String
     private let apiInfoCache: APIInfoCache
 
-    private var apiInfoMap: APIInfoMap = [:]
-    private var sid: String?
+    // `stateLock` guards the mutable session state (discovered API map, sid,
+    // cached credentials) that concurrent requests read while a re-login writes.
+    // A grid loading many thumbnails in parallel drives requests concurrently, so
+    // without this the reads/writes are data races (the class is @unchecked
+    // Sendable). The computed accessors below keep every access under the lock,
+    // leaving all existing call sites unchanged. `discoverAPIs`/`login` build the
+    // new map/sid locally and assign once, so no compound update spans the lock.
+    private let stateLock = NSLock()
+    private var _apiInfoMap: APIInfoMap = [:]
+    private var _sid: String?
+    private var _lastCredentials: (username: String, password: String)?
 
-    // Session auto-recovery: the last successful credentials (kept in memory
-    // only — they already live in the app's encrypted store) let an expired sid
-    // be renewed transparently mid-session. `reloginTask` serializes concurrent
-    // expiry so a burst of failing requests triggers exactly one re-login.
-    private var lastCredentials: (username: String, password: String)?
+    private var apiInfoMap: APIInfoMap {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _apiInfoMap }
+        set { stateLock.lock(); defer { stateLock.unlock() }; _apiInfoMap = newValue }
+    }
+    private var sid: String? {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _sid }
+        set { stateLock.lock(); defer { stateLock.unlock() }; _sid = newValue }
+    }
+    // Session auto-recovery: the last successful credentials (kept in memory only
+    // — they already live in the app's encrypted store) let an expired sid be
+    // renewed transparently mid-session.
+    private var lastCredentials: (username: String, password: String)? {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _lastCredentials }
+        set { stateLock.lock(); defer { stateLock.unlock() }; _lastCredentials = newValue }
+    }
+
+    // `reloginTask` serializes concurrent expiry so a burst of failing requests
+    // triggers exactly one re-login.
     private let reloginLock = NSLock()
     private var reloginTask: Task<Void, Error>?
 
