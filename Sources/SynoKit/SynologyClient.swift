@@ -312,6 +312,29 @@ public final class SynologyClient: @unchecked Sendable {
         return (data, http)
     }
 
+    /// Executes a Range request against a discovered API (e.g. video streaming via
+    /// `SYNO.Foto.Download`) with the same one-shot session-expiry relogin+retry
+    /// as `requestData`. Unlike a pre-built URL with a baked-in `_sid`, the URL is
+    /// (re)built here from the *current* sid, so a mid-playback session renewal
+    /// takes effect on retry. Returns bytes + HTTP response (Content-Range/status).
+    public func rangeRequest(api: String, method: String, version: Int? = nil,
+                             queryItems: [URLQueryItem] = [], rangeHeader: String) async throws -> (Data, HTTPURLResponse) {
+        let (data, http) = try await rangeRequestOnce(api: api, method: method, version: version, queryItems: queryItems, rangeHeader: rangeHeader)
+        guard sessionErrorCode(in: data) != nil else { return (data, http) }
+        try await reloginWithStoredCredentials()
+        return try await rangeRequestOnce(api: api, method: method, version: version, queryItems: queryItems, rangeHeader: rangeHeader)
+    }
+
+    private func rangeRequestOnce(api: String, method: String, version: Int?,
+                                  queryItems: [URLQueryItem], rangeHeader: String) async throws -> (Data, HTTPURLResponse) {
+        guard let url = authenticatedURL(api: api, method: method, version: version, queryItems: queryItems) else {
+            throw SynologyAPIError.sessionExpired
+        }
+        var request = URLRequest(url: url)
+        request.setValue(rangeHeader, forHTTPHeaderField: "Range")
+        return try await rawData(for: request)
+    }
+
     /// POSTs a multipart/form-data body to a discovered API (file uploads:
     /// torrents, photos). The `build` closure receives the live session id and
     /// the endpoint's max version so it can assemble the exact form fields DSM
