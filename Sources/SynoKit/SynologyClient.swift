@@ -12,6 +12,12 @@ public final class SynologyClient: @unchecked Sendable {
     private let connection: NASConnection
     private let session: URLSession
     private let trustDelegate: CertificateTrustDelegate
+    // Separate session for large transfers (originals, zips, video range
+    // streaming). The API `session` caps every resource at 30s, which kills any
+    // download longer than that; this one uses a long resource timeout while the
+    // 30s idle/request timeout still catches dead connections.
+    private let downloadSession: URLSession
+    private let downloadTrustDelegate: CertificateTrustDelegate
     private let sessionName: String
     private let apiInfoCache: APIInfoCache
 
@@ -31,14 +37,24 @@ public final class SynologyClient: @unchecked Sendable {
     /// Production initializer: builds a per-host pinned session.
     public convenience init(connection: NASConnection, sessionName: String = "SynoKit", apiInfoCache: APIInfoCache = .shared) {
         let (session, trustDelegate) = NetworkSessionProvider.makeSession(host: connection.host, port: connection.port)
-        self.init(connection: connection, session: session, trustDelegate: trustDelegate, sessionName: sessionName, apiInfoCache: apiInfoCache)
+        // Same host:port cert pinning, but a 1h resource cap so big files finish.
+        let (downloadSession, downloadTrustDelegate) = NetworkSessionProvider.makeSession(
+            host: connection.host, port: connection.port, requestTimeout: 30, resourceTimeout: 3600)
+        self.init(connection: connection, session: session, trustDelegate: trustDelegate,
+                  downloadSession: downloadSession, downloadTrustDelegate: downloadTrustDelegate,
+                  sessionName: sessionName, apiInfoCache: apiInfoCache)
     }
 
-    /// Injectable initializer (tests pass a stubbed `URLSession`).
-    public init(connection: NASConnection, session: URLSession, trustDelegate: CertificateTrustDelegate, sessionName: String = "SynoKit", apiInfoCache: APIInfoCache = .shared) {
+    /// Injectable initializer (tests pass a stubbed `URLSession`). `downloadSession`
+    /// defaults to `session` so existing stubs drive both paths.
+    public init(connection: NASConnection, session: URLSession, trustDelegate: CertificateTrustDelegate,
+                downloadSession: URLSession? = nil, downloadTrustDelegate: CertificateTrustDelegate? = nil,
+                sessionName: String = "SynoKit", apiInfoCache: APIInfoCache = .shared) {
         self.connection = connection
         self.session = session
         self.trustDelegate = trustDelegate
+        self.downloadSession = downloadSession ?? session
+        self.downloadTrustDelegate = downloadTrustDelegate ?? trustDelegate
         self.sessionName = sessionName
         self.apiInfoCache = apiInfoCache
     }
@@ -267,7 +283,9 @@ public final class SynologyClient: @unchecked Sendable {
     /// code and headers (Content-Range, Content-Type). Reuses the same TLS trust
     /// as every other call, so AVFoundation streaming works with a self-signed NAS.
     public func rawData(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
-        let (data, response) = try await session.data(for: request)
+        // Video range streaming: long-transfer session so a big range isn't
+        // guillotined by the API session's 30s resource cap.
+        let (data, response) = try await downloadSession.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw SynologyAPIError.invalidResponse }
         return (data, http)
     }
@@ -382,14 +400,14 @@ public final class SynologyClient: @unchecked Sendable {
         ] + queryItems
         guard let url = components.url else { throw SynologyAPIError.invalidResponse }
 
-        trustDelegate.clearPendingEvent()
+        downloadTrustDelegate.clearPendingEvent()
         do {
-            let (tempURL, _) = try await session.download(for: URLRequest(url: url))
+            let (tempURL, _) = try await downloadSession.download(for: URLRequest(url: url))
             try? FileManager.default.removeItem(at: destination)
             try FileManager.default.moveItem(at: tempURL, to: destination)
         } catch {
-            if let event = trustDelegate.pendingTrustEvent {
-                trustDelegate.clearPendingEvent()
+            if let event = downloadTrustDelegate.pendingTrustEvent {
+                downloadTrustDelegate.clearPendingEvent()
                 switch event {
                 case .untrusted(let fingerprint, let certificateData):
                     throw SynologyAPIError.certificateUntrusted(host: connection.host, port: connection.port, fingerprint: fingerprint, leafCertData: certificateData)
