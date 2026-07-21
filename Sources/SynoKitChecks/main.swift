@@ -121,6 +121,33 @@ do {
     checks.expect(false, "discover+login threw: \(error)")
 }
 
+// BUG-2 regression: many authenticated requests run concurrently through one
+// shared client, all reading sid/apiInfoMap. Under `-sanitize=thread` this
+// flags any unlocked access to that shared session state.
+StubURLProtocol.setHandler { request in
+    if request.url!.absoluteString.contains("SYNO.API.Info") {
+        return (200, #"{"success":true,"data":{"SYNO.API.Auth":{"path":"auth.cgi","minVersion":1,"maxVersion":6},"SYNO.Foto.Browse.Album":{"path":"entry.cgi","minVersion":1,"maxVersion":2}}}"#.data(using: .utf8)!)
+    }
+    if request.httpMethod == "POST" { return (200, #"{"success":true,"data":{"sid":"SID"}}"#.data(using: .utf8)!) }
+    return (200, #"{"success":true,"data":{"id":1,"name":"x"}}"#.data(using: .utf8)!)
+}
+do {
+    let client = makeClient()
+    try await client.discoverAPIs(["SYNO.API.Auth", "SYNO.Foto.Browse.Album"])
+    try await client.login(username: "me", password: "pw")
+    let ok = await withTaskGroup(of: Bool.self) { group -> Int in
+        for _ in 0..<50 {
+            group.addTask { (try? await client.requestData(api: "SYNO.Foto.Browse.Album", method: "list")) != nil }
+        }
+        var n = 0
+        for await r in group where r { n += 1 }
+        return n
+    }
+    checks.expect(ok == 50, "50 concurrent requests share the client cleanly")
+} catch {
+    checks.expect(false, "concurrent requests threw: \(error)")
+}
+
 // bad credentials
 StubURLProtocol.setHandler { request in
     if request.url!.absoluteString.contains("SYNO.API.Info") { return (200, authInfo.data(using: .utf8)!) }
