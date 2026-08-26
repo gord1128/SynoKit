@@ -4,3 +4,5 @@
 DerivedData/
 .swiftpm/xcode/package.xcworkspace/xcuserdata/
 *.xcodeproj/xcuserdata/
+# Xcode의 개인 상태 (경로에 사용자 이름이 들어간다). 공개 저장소에 있을 것이 아니다.
+.swiftpm/xcode/xcuserdata/
