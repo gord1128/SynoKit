@@ -114,8 +114,15 @@ public final class SynologyClient: @unchecked Sendable {
         var map = try await queryAPIInfo(baseURL: baseURL, query: apiNames.joined(separator: ","))
         let missing = mustResolve.subtracting(map.keys)
         if !missing.isEmpty {
+            // Worth logging: which APIs a NAS fails to resolve is the first
+            // thing to look at when a feature is missing on someone else's DSM.
+            SynoLog.net.info("targeted 질의가 \(missing.count, privacy: .public)개를 빠뜨림 → query=all 스윕 (\(missing.sorted().joined(separator: ","), privacy: .public))")
             let all = try await queryAPIInfo(baseURL: baseURL, query: "all")
             map = all.merging(map) { current, _ in current }
+            let stillMissing = mustResolve.subtracting(map.keys)
+            if !stillMissing.isEmpty {
+                SynoLog.net.error("이 NAS가 지원하지 않는 API: \(stillMissing.sorted().joined(separator: ","), privacy: .public)")
+            }
         }
         // SYNO.API.Auth is always at a known path even if Info omits it.
         if map["SYNO.API.Auth"] == nil {
@@ -186,8 +193,14 @@ public final class SynologyClient: @unchecked Sendable {
         let data = try await send(request)
         let decoded = try decodeJSON(DSMEnvelope<LoginData>.self, from: data)
         guard decoded.success, let loginData = decoded.data else {
-            throw SynologyAPIError.fromAuthErrorCode(decoded.error?.code ?? -1)
+            let code = decoded.error?.code ?? -1
+            // The code is what tells bad password (400) from OTP required (403)
+            // from an account the NAS has locked (407) — the user only ever sees
+            // the mapped sentence.
+            SynoLog.auth.error("로그인 거절 code=\(code, privacy: .public) host=\(self.connection.host, privacy: .private)")
+            throw SynologyAPIError.fromAuthErrorCode(code)
         }
+        SynoLog.auth.notice("로그인 성공 host=\(self.connection.host, privacy: .private) otp=\(otpCode != nil, privacy: .public)")
         sid = loginData.sid
         // OTP codes are one-time, so silent re-login stores only user/password.
         // 2FA accounts will surface an auth error instead of renewing silently.
@@ -223,7 +236,11 @@ public final class SynologyClient: @unchecked Sendable {
             let credentials = lastCredentials
             let t = Task {
                 defer { self.withReloginLock { self.reloginTask = nil } }
-                guard let credentials else { throw SynologyAPIError.sessionExpired }
+                guard let credentials else {
+                    SynoLog.auth.error("세션 만료됐는데 저장된 자격증명이 없다 — 재로그인 불가")
+                    throw SynologyAPIError.sessionExpired
+                }
+                SynoLog.auth.notice("세션 만료 → 조용히 재로그인")
                 try await self.login(username: credentials.username, password: credentials.password)
             }
             reloginTask = t
@@ -476,11 +493,17 @@ public final class SynologyClient: @unchecked Sendable {
                 trustDelegate.clearPendingEvent()
                 switch event {
                 case .untrusted(let fingerprint, let certificateData):
+                    SynoLog.net.notice("신뢰하지 않는 인증서 — 사용자 확인 대기 host=\(self.connection.host, privacy: .private)")
                     throw SynologyAPIError.certificateUntrusted(host: connection.host, port: connection.port, fingerprint: fingerprint, leafCertData: certificateData)
                 case .changed(let old, let new, let newCertificateData):
+                    SynoLog.net.error("인증서가 바뀌었다 — 사용자 확인 대기 host=\(self.connection.host, privacy: .private)")
                     throw SynologyAPIError.certificateChanged(host: connection.host, port: connection.port, oldFingerprint: old, newFingerprint: new, newCertificateData: newCertificateData)
                 }
             }
+            // URLError 코드가 진단의 알맹이다: -1009(오프라인)·-1001(타임아웃)·
+            // -1005(연결 끊김)를 구분해야 일시적 문제인지 설정 문제인지 갈린다.
+            let code = (error as? URLError)?.code.rawValue ?? -1
+            SynoLog.net.error("요청 실패 urlerror=\(code, privacy: .public) host=\(self.connection.host, privacy: .private) \(error.localizedDescription, privacy: .private)")
             throw SynologyAPIError.hostUnreachable(underlying: error)
         }
     }
@@ -489,6 +512,9 @@ public final class SynologyClient: @unchecked Sendable {
         do {
             return try JSONDecoder().decode(type, from: data)
         } catch {
+            // 응답 본문은 사용자 데이터라 찍지 않는다. 타입과 길이만으로도
+            // "어느 API가 우리가 모르는 모양을 보내는가"는 좁혀진다.
+            SynoLog.decoding.error("\(String(describing: T.self), privacy: .public) 디코딩 실패 bytes=\(data.count, privacy: .public) — \(error, privacy: .private)")
             throw SynologyAPIError.decodingError(error)
         }
     }
