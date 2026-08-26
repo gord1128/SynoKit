@@ -104,18 +104,35 @@ public final class SynologyClient: @unchecked Sendable {
         // query dropped, which the sweep then resolves) busts the cache instead
         // of returning a stale map missing that API.
         let key = cacheKey(for: apiNames, required: required)
-        if !forceRefresh, let cached = await apiInfoCache.map(for: key) {
-            apiInfoMap = cached
-            return cached
-        }
         let mustResolve = required ?? Set(apiNames)
+        if !forceRefresh, let cached = await apiInfoCache.map(for: key) {
+            // A cached map is only usable if it actually carries every required
+            // API. Otherwise it's a map written before this NAS gained the API
+            // (a DSM upgrade) or before we started requiring it — and since the
+            // cache is consulted before the `query=all` sweep, an incomplete
+            // entry would keep the feature "unsupported" forever. The disk cache
+            // outlives the process, so this repaired itself on no timescale at
+            // all. (Caught by a check that connected to the same host twice.)
+            if mustResolve.isSubset(of: Set(cached.keys)) {
+                apiInfoMap = cached
+                return cached
+            }
+            SynoLog.net.info("캐시된 API 맵에 필요한 항목이 빠져 있다 → 다시 조회")
+        }
         guard let baseURL = connection.baseURL else { throw SynologyAPIError.invalidResponse }
 
         var map = try await queryAPIInfo(baseURL: baseURL, query: apiNames.joined(separator: ","))
         let missing = mustResolve.subtracting(map.keys)
         if !missing.isEmpty {
+            // Worth logging: which APIs a NAS fails to resolve is the first
+            // thing to look at when a feature is missing on someone else's DSM.
+            SynoLog.net.info("targeted 질의가 \(missing.count, privacy: .public)개를 빠뜨림 → query=all 스윕 (\(missing.sorted().joined(separator: ","), privacy: .public))")
             let all = try await queryAPIInfo(baseURL: baseURL, query: "all")
             map = all.merging(map) { current, _ in current }
+            let stillMissing = mustResolve.subtracting(map.keys)
+            if !stillMissing.isEmpty {
+                SynoLog.net.error("이 NAS가 지원하지 않는 API: \(stillMissing.sorted().joined(separator: ","), privacy: .public)")
+            }
         }
         // SYNO.API.Auth is always at a known path even if Info omits it.
         if map["SYNO.API.Auth"] == nil {
@@ -186,8 +203,14 @@ public final class SynologyClient: @unchecked Sendable {
         let data = try await send(request)
         let decoded = try decodeJSON(DSMEnvelope<LoginData>.self, from: data)
         guard decoded.success, let loginData = decoded.data else {
-            throw SynologyAPIError.fromAuthErrorCode(decoded.error?.code ?? -1)
+            let code = decoded.error?.code ?? -1
+            // The code is what tells bad password (400) from OTP required (403)
+            // from an account the NAS has locked (407) — the user only ever sees
+            // the mapped sentence.
+            SynoLog.auth.error("로그인 거절 code=\(code, privacy: .public) host=\(self.connection.host, privacy: .private)")
+            throw SynologyAPIError.fromAuthErrorCode(code)
         }
+        SynoLog.auth.notice("로그인 성공 host=\(self.connection.host, privacy: .private) otp=\(otpCode != nil, privacy: .public)")
         sid = loginData.sid
         // OTP codes are one-time, so silent re-login stores only user/password.
         // 2FA accounts will surface an auth error instead of renewing silently.
@@ -223,7 +246,11 @@ public final class SynologyClient: @unchecked Sendable {
             let credentials = lastCredentials
             let t = Task {
                 defer { self.withReloginLock { self.reloginTask = nil } }
-                guard let credentials else { throw SynologyAPIError.sessionExpired }
+                guard let credentials else {
+                    SynoLog.auth.error("세션 만료됐는데 저장된 자격증명이 없다 — 재로그인 불가")
+                    throw SynologyAPIError.sessionExpired
+                }
+                SynoLog.auth.notice("세션 만료 → 조용히 재로그인")
                 try await self.login(username: credentials.username, password: credentials.password)
             }
             reloginTask = t
@@ -377,6 +404,77 @@ public final class SynologyClient: @unchecked Sendable {
         return try await send(request)
     }
 
+    /// POSTs a multipart body that lives in a FILE rather than in memory, for
+    /// uploads of arbitrary size.
+    ///
+    /// `requestMultipart` above assembles the whole body as `Data` and hands it
+    /// to `httpBody`, which means a 2 GB video is held two or three times over
+    /// (the file's bytes, the assembled body, and URLSession's own copy). That
+    /// is fine for a torrent file and fatal for a video: an 8 GB machine swaps
+    /// and the app gets killed.
+    ///
+    /// Here the caller writes prologue + file + epilogue into a temp file and
+    /// URLSession streams it from disk. Session expiry is retried the same way
+    /// as everywhere else — the `_sid` lives in the URL, not the body, so the
+    /// same file can be re-sent as-is.
+    public func requestMultipartFile(
+        api: String,
+        extraQuery: [URLQueryItem] = [],
+        pathSuffix: String? = nil,
+        contentType: String,
+        bodyFileURL: URL
+    ) async throws -> Data {
+        let data = try await requestMultipartFileOnce(api: api, extraQuery: extraQuery, pathSuffix: pathSuffix,
+                                                      contentType: contentType, bodyFileURL: bodyFileURL)
+        guard sessionErrorCode(in: data) != nil else { return data }
+        try await reloginWithStoredCredentials()
+        return try await requestMultipartFileOnce(api: api, extraQuery: extraQuery, pathSuffix: pathSuffix,
+                                                  contentType: contentType, bodyFileURL: bodyFileURL)
+    }
+
+    private func requestMultipartFileOnce(
+        api: String,
+        extraQuery: [URLQueryItem],
+        pathSuffix: String?,
+        contentType: String,
+        bodyFileURL: URL
+    ) async throws -> Data {
+        guard let sid else { throw SynologyAPIError.sessionExpired }
+        guard let endpoint = apiInfoMap[api] else { throw SynologyAPIError.apiUnavailable(apiName: api) }
+        guard let baseURL = connection.baseURL else { throw SynologyAPIError.invalidResponse }
+
+        var path = "webapi/\(endpoint.path)"
+        if let pathSuffix { path += "/\(pathSuffix)" }
+        var components = URLComponents(url: baseURL.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
+        components.queryItems = [URLQueryItem(name: "_sid", value: sid)] + extraQuery
+        guard let url = components.url else { throw SynologyAPIError.invalidResponse }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue(contentType, forHTTPHeaderField: "Content-Type")
+
+        // The long-transfer session: the API session caps every resource at 30s,
+        // which would guillotine any upload bigger than a phone snapshot.
+        downloadTrustDelegate.clearPendingEvent()
+        do {
+            let (data, _) = try await downloadSession.upload(for: request, fromFile: bodyFileURL)
+            return data
+        } catch {
+            if let event = downloadTrustDelegate.pendingTrustEvent {
+                downloadTrustDelegate.clearPendingEvent()
+                switch event {
+                case .untrusted(let fingerprint, let certificateData):
+                    throw SynologyAPIError.certificateUntrusted(host: connection.host, port: connection.port, fingerprint: fingerprint, leafCertData: certificateData)
+                case .changed(let old, let new, let newCertificateData):
+                    throw SynologyAPIError.certificateChanged(host: connection.host, port: connection.port, oldFingerprint: old, newFingerprint: new, newCertificateData: newCertificateData)
+                }
+            }
+            let code = (error as? URLError)?.code.rawValue ?? -1
+            SynoLog.net.error("업로드 실패 urlerror=\(code, privacy: .public) host=\(self.connection.host, privacy: .private)")
+            throw SynologyAPIError.hostUnreachable(underlying: error)
+        }
+    }
+
     /// Executes a request and decodes `DSMEnvelope<T>`, throwing a typed error
     /// (via `errorMapper`, default `fromDataErrorCode`) when the envelope fails.
     public func perform<T: Decodable>(
@@ -476,11 +574,17 @@ public final class SynologyClient: @unchecked Sendable {
                 trustDelegate.clearPendingEvent()
                 switch event {
                 case .untrusted(let fingerprint, let certificateData):
+                    SynoLog.net.notice("신뢰하지 않는 인증서 — 사용자 확인 대기 host=\(self.connection.host, privacy: .private)")
                     throw SynologyAPIError.certificateUntrusted(host: connection.host, port: connection.port, fingerprint: fingerprint, leafCertData: certificateData)
                 case .changed(let old, let new, let newCertificateData):
+                    SynoLog.net.error("인증서가 바뀌었다 — 사용자 확인 대기 host=\(self.connection.host, privacy: .private)")
                     throw SynologyAPIError.certificateChanged(host: connection.host, port: connection.port, oldFingerprint: old, newFingerprint: new, newCertificateData: newCertificateData)
                 }
             }
+            // URLError 코드가 진단의 알맹이다: -1009(오프라인)·-1001(타임아웃)·
+            // -1005(연결 끊김)를 구분해야 일시적 문제인지 설정 문제인지 갈린다.
+            let code = (error as? URLError)?.code.rawValue ?? -1
+            SynoLog.net.error("요청 실패 urlerror=\(code, privacy: .public) host=\(self.connection.host, privacy: .private) \(error.localizedDescription, privacy: .private)")
             throw SynologyAPIError.hostUnreachable(underlying: error)
         }
     }
@@ -489,6 +593,9 @@ public final class SynologyClient: @unchecked Sendable {
         do {
             return try JSONDecoder().decode(type, from: data)
         } catch {
+            // 응답 본문은 사용자 데이터라 찍지 않는다. 타입과 길이만으로도
+            // "어느 API가 우리가 모르는 모양을 보내는가"는 좁혀진다.
+            SynoLog.decoding.error("\(String(describing: T.self), privacy: .public) 디코딩 실패 bytes=\(data.count, privacy: .public) — \(error, privacy: .private)")
             throw SynologyAPIError.decodingError(error)
         }
     }

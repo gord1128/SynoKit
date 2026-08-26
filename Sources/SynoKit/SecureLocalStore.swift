@@ -71,9 +71,19 @@ public enum SecureLocalStore {
             return SymmetricKey(data: existing)
         }
         var randomBytes = [UInt8](repeating: 0, count: 32)
-        _ = SecRandomCopyBytes(kSecRandomDefault, randomBytes.count, &randomBytes)
+        let status = SecRandomCopyBytes(kSecRandomDefault, randomBytes.count, &randomBytes)
+        if status != errSecSuccess {
+            SynoLog.store.fault("마스터 키 난수 생성 실패 status=\(status, privacy: .public)")
+        }
         let key = Data(randomBytes)
-        try? key.write(to: url, options: .atomic)
+        do {
+            try key.write(to: url, options: .atomic)
+        } catch {
+            // 이게 조용히 실패하면 다음 실행에서 새 키가 만들어지고, 기존에 저장된
+            // 비밀번호는 전부 복호화 불가가 된다 — 사용자에겐 "갑자기 로그인이
+            // 풀렸다"로 보인다. 원인을 알 수 있게 반드시 남긴다.
+            SynoLog.store.fault("마스터 키를 못 썼다 — 저장된 자격증명이 다음 실행에서 무효가 된다: \(error, privacy: .private)")
+        }
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         return SymmetricKey(data: key)
     }
@@ -91,15 +101,27 @@ public enum SecureLocalStore {
     }
 
     private static func writeEntries(_ entries: [String: String]) {
-        guard let data = try? JSONEncoder().encode(entries) else { return }
-        try? data.write(to: fileURL, options: .atomic)
+        guard let data = try? JSONEncoder().encode(entries) else {
+            SynoLog.store.error("보안 저장소 인코딩 실패 — 항목 \(entries.count, privacy: .public)개를 못 썼다")
+            return
+        }
+        do {
+            try data.write(to: fileURL, options: .atomic)
+        } catch {
+            // 디스크가 꽉 찼거나 권한이 없을 때. 지금까지는 조용히 넘어가서
+            // "비밀번호가 저장되지 않는다"는 증상만 남았다.
+            SynoLog.store.error("보안 저장소 쓰기 실패: \(error, privacy: .private)")
+        }
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
     }
 
     @discardableResult
     public static func save(service: String, account: String, data: Data) -> Bool {
         guard let sealed = try? AES.GCM.seal(data, using: encryptionKey),
-              let combined = sealed.combined else { return false }
+              let combined = sealed.combined else {
+            SynoLog.store.error("항목 봉인 실패 service=\(service, privacy: .public)")
+            return false
+        }
         ioLock.lock(); defer { ioLock.unlock() }
         var entries = loadEntries()
         entries[storageKey(service: service, account: account)] = combined.base64EncodedString()
