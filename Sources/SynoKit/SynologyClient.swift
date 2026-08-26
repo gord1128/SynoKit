@@ -104,11 +104,21 @@ public final class SynologyClient: @unchecked Sendable {
         // query dropped, which the sweep then resolves) busts the cache instead
         // of returning a stale map missing that API.
         let key = cacheKey(for: apiNames, required: required)
-        if !forceRefresh, let cached = await apiInfoCache.map(for: key) {
-            apiInfoMap = cached
-            return cached
-        }
         let mustResolve = required ?? Set(apiNames)
+        if !forceRefresh, let cached = await apiInfoCache.map(for: key) {
+            // A cached map is only usable if it actually carries every required
+            // API. Otherwise it's a map written before this NAS gained the API
+            // (a DSM upgrade) or before we started requiring it — and since the
+            // cache is consulted before the `query=all` sweep, an incomplete
+            // entry would keep the feature "unsupported" forever. The disk cache
+            // outlives the process, so this repaired itself on no timescale at
+            // all. (Caught by a check that connected to the same host twice.)
+            if mustResolve.isSubset(of: Set(cached.keys)) {
+                apiInfoMap = cached
+                return cached
+            }
+            SynoLog.net.info("캐시된 API 맵에 필요한 항목이 빠져 있다 → 다시 조회")
+        }
         guard let baseURL = connection.baseURL else { throw SynologyAPIError.invalidResponse }
 
         var map = try await queryAPIInfo(baseURL: baseURL, query: apiNames.joined(separator: ","))
@@ -392,6 +402,77 @@ public final class SynologyClient: @unchecked Sendable {
         request.setValue(contentType, forHTTPHeaderField: "Content-Type")
         request.httpBody = body
         return try await send(request)
+    }
+
+    /// POSTs a multipart body that lives in a FILE rather than in memory, for
+    /// uploads of arbitrary size.
+    ///
+    /// `requestMultipart` above assembles the whole body as `Data` and hands it
+    /// to `httpBody`, which means a 2 GB video is held two or three times over
+    /// (the file's bytes, the assembled body, and URLSession's own copy). That
+    /// is fine for a torrent file and fatal for a video: an 8 GB machine swaps
+    /// and the app gets killed.
+    ///
+    /// Here the caller writes prologue + file + epilogue into a temp file and
+    /// URLSession streams it from disk. Session expiry is retried the same way
+    /// as everywhere else — the `_sid` lives in the URL, not the body, so the
+    /// same file can be re-sent as-is.
+    public func requestMultipartFile(
+        api: String,
+        extraQuery: [URLQueryItem] = [],
+        pathSuffix: String? = nil,
+        contentType: String,
+        bodyFileURL: URL
+    ) async throws -> Data {
+        let data = try await requestMultipartFileOnce(api: api, extraQuery: extraQuery, pathSuffix: pathSuffix,
+                                                      contentType: contentType, bodyFileURL: bodyFileURL)
+        guard sessionErrorCode(in: data) != nil else { return data }
+        try await reloginWithStoredCredentials()
+        return try await requestMultipartFileOnce(api: api, extraQuery: extraQuery, pathSuffix: pathSuffix,
+                                                  contentType: contentType, bodyFileURL: bodyFileURL)
+    }
+
+    private func requestMultipartFileOnce(
+        api: String,
+        extraQuery: [URLQueryItem],
+        pathSuffix: String?,
+        contentType: String,
+        bodyFileURL: URL
+    ) async throws -> Data {
+        guard let sid else { throw SynologyAPIError.sessionExpired }
+        guard let endpoint = apiInfoMap[api] else { throw SynologyAPIError.apiUnavailable(apiName: api) }
+        guard let baseURL = connection.baseURL else { throw SynologyAPIError.invalidResponse }
+
+        var path = "webapi/\(endpoint.path)"
+        if let pathSuffix { path += "/\(pathSuffix)" }
+        var components = URLComponents(url: baseURL.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
+        components.queryItems = [URLQueryItem(name: "_sid", value: sid)] + extraQuery
+        guard let url = components.url else { throw SynologyAPIError.invalidResponse }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue(contentType, forHTTPHeaderField: "Content-Type")
+
+        // The long-transfer session: the API session caps every resource at 30s,
+        // which would guillotine any upload bigger than a phone snapshot.
+        downloadTrustDelegate.clearPendingEvent()
+        do {
+            let (data, _) = try await downloadSession.upload(for: request, fromFile: bodyFileURL)
+            return data
+        } catch {
+            if let event = downloadTrustDelegate.pendingTrustEvent {
+                downloadTrustDelegate.clearPendingEvent()
+                switch event {
+                case .untrusted(let fingerprint, let certificateData):
+                    throw SynologyAPIError.certificateUntrusted(host: connection.host, port: connection.port, fingerprint: fingerprint, leafCertData: certificateData)
+                case .changed(let old, let new, let newCertificateData):
+                    throw SynologyAPIError.certificateChanged(host: connection.host, port: connection.port, oldFingerprint: old, newFingerprint: new, newCertificateData: newCertificateData)
+                }
+            }
+            let code = (error as? URLError)?.code.rawValue ?? -1
+            SynoLog.net.error("업로드 실패 urlerror=\(code, privacy: .public) host=\(self.connection.host, privacy: .private)")
+            throw SynologyAPIError.hostUnreachable(underlying: error)
+        }
     }
 
     /// Executes a request and decodes `DSMEnvelope<T>`, throwing a typed error
